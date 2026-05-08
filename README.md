@@ -19,13 +19,21 @@ Smoke test: `--limit 100 --out data/smoke.jsonl`.
 
 ## 2. Embed each sense with Gemma-4-31B
 
-For each row, runs one forward pass and captures the hidden state at the output of layer `round(2/3 * num_hidden_layers) = 40` of 60 (last token, fp16).
+For each row, runs one forward pass and captures the hidden state at the output of layer `round(2/3 * num_hidden_layers) = 40` of 60 (last token, bf16).
 
 ```bash
 uv run python -m missing.embed
-# -> data/embeddings.bin   fp16 memmap [N, 5376]
+# -> data/embeddings.bin   bf16 [N, 5376] mmapped via torch.from_file
 #    data/meta.json        run config
 #    data/progress.txt     resume marker
+```
+
+To read the embeddings back:
+
+```python
+emb = torch.from_file(
+    "data/embeddings.bin", shared=False, size=N * 5376, dtype=torch.bfloat16,
+).view(N, 5376)
 ```
 
 Crash-resume: rerun the same command. Smoke test: `--limit 200 --out-dir data/smoke`.

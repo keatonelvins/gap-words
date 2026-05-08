@@ -20,7 +20,10 @@ Speed setup
 
 Output (default `data/`)
 ------------------------
-    embeddings.bin   fp16 [N, hidden_dim] memmap; row i ↔ input row i
+    embeddings.bin   bf16 [N, hidden_dim] mmap over the raw bytes; row i ↔
+                     input row i. Read back with:
+                         torch.from_file(path, shared=False, size=N*D,
+                                         dtype=torch.bfloat16).view(N, D)
     meta.json        run config + shape
     progress.txt     last completed row index (for crash-resume)
 """
@@ -32,9 +35,8 @@ import time
 from itertools import islice
 from pathlib import Path
 
-import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 torch.set_float32_matmul_precision("high")
 
@@ -66,11 +68,7 @@ def main() -> None:
     if args.limit is not None:
         n_rows = min(n_rows, args.limit)
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    tok = getattr(processor, "tokenizer", processor)
-    tok.padding_side = "left"
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    tok = AutoTokenizer.from_pretrained(args.model_id, padding_side="left")
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id, dtype=torch.bfloat16, device_map="cuda",
@@ -91,7 +89,7 @@ def main() -> None:
     captured: dict[str, torch.Tensor] = {}
 
     def hook(_module, _inp, output):
-        captured["h"] = output[0] if isinstance(output, tuple) else output
+        captured["h"] = output  # Gemma4TextDecoderLayer returns the [B, T, D] tensor
 
     text_layers[layer_idx].register_forward_hook(hook)
 
@@ -105,19 +103,20 @@ def main() -> None:
         print(f"already complete ({start:,} rows)", file=sys.stderr)
         return
 
-    mode = "r+" if start > 0 else "w+"
-    embeddings = np.memmap(
-        emb_path, dtype=np.float16, mode=mode, shape=(n_rows, hidden_dim),
-    )
+    # mmap a bf16 tensor over the raw file. Creates the file at the right size
+    # if it doesn't exist; otherwise opens in place without zeroing existing rows.
+    embeddings = torch.from_file(
+        str(emb_path), shared=True, size=n_rows * hidden_dim,
+        dtype=torch.bfloat16,
+    ).view(n_rows, hidden_dim)
     meta_path.write_text(json.dumps({
         "n": n_rows,
         "hidden_dim": hidden_dim,
-        "dtype": "float16",
+        "dtype": "bfloat16",
         "layer_idx": layer_idx,
         "n_layers": n_layers,
         "layer_frac": args.layer_frac,
         "model_id": args.model_id,
-        "attn_implementation": "sdpa",
         "rows_path": str(args.rows),
         "max_length": args.max_length,
         "compiled": not args.no_compile,
@@ -125,14 +124,14 @@ def main() -> None:
     print(f"writing rows [{start:,}, {n_rows:,}) to {emb_path}", file=sys.stderr)
 
     @torch.inference_mode()
-    def embed(texts: list[str]) -> np.ndarray:
-        toks = processor(
-            text=texts, return_tensors="pt",
+    def embed(texts: list[str]) -> torch.Tensor:
+        toks = tok(
+            texts, return_tensors="pt",
             padding="max_length", truncation=True, max_length=args.max_length,
         ).to(model.device)
         model(**toks, use_cache=False)
         h = captured["h"]  # [B, T, D] — populated by the forward hook
-        return h[:, -1, :].to(torch.float16).cpu().numpy()  # left-pad → last is real
+        return h[:, -1, :].to("cpu", dtype=torch.bfloat16)  # left-pad → last is real
 
     written = start
     t0 = time.time()
@@ -145,7 +144,6 @@ def main() -> None:
         emb = embed(batch)
         embeddings[written:written + emb.shape[0]] = emb
         written += emb.shape[0]
-        embeddings.flush()
         progress_path.write_text(str(written))
         batch.clear()
 
