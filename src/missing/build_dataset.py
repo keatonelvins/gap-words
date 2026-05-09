@@ -19,10 +19,23 @@ Fields we read per entry:
                     becomes glosses=["parent"] and glosses=["parent", "child"]
                     on two separate sense entries. So glosses[-1] is the leaf
                     definition and glosses[:-1] is its ancestor path. See
-                    wiktextract/docs/new_extractor_guide.md.
+                    https://github.com/tatuylonen/wiktextract/blob/master/docs/new_extractor_guide.md
       tags[]        linguistic tags: "transitive", "obsolete", ...
       topics[]      subject areas: "computing", "biology", ...
       categories[]  wiki categories: "English terms with quotations", ...
+
+Filters
+-------
+We drop alias / inflection senses that don't carry independent meaning — they
+embed as the literal alias string ("plural of nonhomosexual") rather than the
+meaning of the underlying word. ~40% of English rows are dropped.
+
+A sense is dropped when:
+- its `tags` include any of `form-of`, `alt-of`, `abbreviation`, `initialism`,
+  `acronym`, `misspelling` (the structural wiktextract markers covering
+  inflections, alternative forms, abbreviations, etc.), OR
+- its leaf gloss starts with `Synonym of` / `Synonym for` (which slip through
+  tagless).
 
 Output
 ------
@@ -33,11 +46,10 @@ JSONL, one row per leaf sense:
       "tags": [...], "topics": [...], "categories": [...],
       "gloss":      "<leaf definition>",
       "gloss_path": [<ancestor glosses>],
-      "text":       "{word}: {leaf}"       # what we feed the LM later
     }
 
 Polysemous words ("bank" the institution vs. "bank" the riverside) get one row
-per leaf sense, so each `text` maps cleanly to a single embedding downstream.
+per leaf sense, so each row maps cleanly to a single embedding downstream.
 `sense_idx` is unique within an entry but not across the multiple etymologies
 of the same word — pair it with (word, gloss) or file position for a global key.
 """
@@ -52,12 +64,20 @@ from collections.abc import Iterator
 from pathlib import Path
 
 WIKTIONARY_URL = "https://kaikki.org/dictionary/raw-wiktextract-data.jsonl.gz"
+ALIAS_TAGS = frozenset({
+    "form-of", "alt-of", "abbreviation", "initialism", "acronym", "misspelling",
+})
+ALIAS_GLOSS_PREFIXES = ("Synonym of ", "Synonym for ")
 
 
-def stream_lines(url: str) -> Iterator[bytes]:
-    """Yield raw bytes lines from a gzipped jsonl URL."""
-    resp = urllib.request.urlopen(url)
-    yield from gzip.GzipFile(fileobj=resp)
+def stream_lines(src: str) -> Iterator[bytes]:
+    """Yield raw bytes lines from a gzipped jsonl URL or local file."""
+    if src.startswith(("http://", "https://")):
+        resp = urllib.request.urlopen(src)
+        yield from gzip.GzipFile(fileobj=resp)
+    else:
+        with gzip.open(src, "rb") as f:
+            yield from f
 
 
 def iter_rows(entry: dict, lang_code: str) -> Iterator[dict]:
@@ -68,22 +88,26 @@ def iter_rows(entry: dict, lang_code: str) -> Iterator[dict]:
         glosses = sense.get("glosses") or []
         if not glosses or not glosses[-1]:
             continue
+        leaf = glosses[-1]
+        tags = sense.get("tags") or []
+        if any(t in ALIAS_TAGS for t in tags) or leaf.startswith(ALIAS_GLOSS_PREFIXES):
+            continue
         yield {
             "word": entry["word"],
             "pos": entry.get("pos"),
             "sense_idx": sense_idx,
-            "tags": sense.get("tags") or [],
+            "tags": tags,
             "topics": sense.get("topics") or [],
             "categories": sense.get("categories") or [],
-            "gloss": glosses[-1],
+            "gloss": leaf,
             "gloss_path": glosses[:-1],
-            "text": f"{entry['word']}: {glosses[-1]}",
         }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default=WIKTIONARY_URL)
+    parser.add_argument("--src", default=WIKTIONARY_URL,
+                        help="Gzipped jsonl URL or local file path")
     parser.add_argument("--out", type=Path, default=Path("data/english_senses.jsonl"))
     parser.add_argument("--lang-code", default="en")
     parser.add_argument(
@@ -104,7 +128,7 @@ def main() -> None:
         )
 
     with args.out.open("w", encoding="utf-8") as f:
-        for raw in stream_lines(args.url):
+        for raw in stream_lines(args.src):
             n_in += 1
             try:
                 entry = json.loads(raw)

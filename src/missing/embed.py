@@ -42,6 +42,11 @@ torch.set_float32_matmul_precision("high")
 
 MODEL_ID = "google/gemma-4-31B"
 
+# PromptEOL-style: end the prompt at a position where the next token IS the
+# answer. The hidden state at the trailing `"` is the model's prediction of
+# the first (and only) token of the one-word summary — that's our embedding.
+PROMPT_TEMPLATE = '"{word}: {gloss}" can be summarized in one word as: "'
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -50,8 +55,8 @@ def main() -> None:
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--layer-frac", type=float, default=2 / 3,
                         help="Layer index = round(layer_frac * num_hidden_layers)")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-length", type=int, default=128,
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--max-length", type=int, default=64,
                         help="Every batch is left-padded/truncated to exactly this many tokens")
     parser.add_argument("--no-compile", action="store_true",
                         help="Skip torch.compile (useful while debugging)")
@@ -68,7 +73,9 @@ def main() -> None:
     if args.limit is not None:
         n_rows = min(n_rows, args.limit)
 
-    tok = AutoTokenizer.from_pretrained(args.model_id, padding_side="left")
+    tok = AutoTokenizer.from_pretrained(
+        args.model_id, padding_side="left", truncation_side="left",
+    )
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id, dtype=torch.bfloat16, device_map="cuda",
@@ -112,7 +119,6 @@ def main() -> None:
     meta_path.write_text(json.dumps({
         "n": n_rows,
         "hidden_dim": hidden_dim,
-        "dtype": "bfloat16",
         "layer_idx": layer_idx,
         "n_layers": n_layers,
         "layer_frac": args.layer_frac,
@@ -120,6 +126,7 @@ def main() -> None:
         "rows_path": str(args.rows),
         "max_length": args.max_length,
         "compiled": not args.no_compile,
+        "prompt_template": PROMPT_TEMPLATE,
     }, indent=2))
     print(f"writing rows [{start:,}, {n_rows:,}) to {emb_path}", file=sys.stderr)
 
@@ -149,7 +156,8 @@ def main() -> None:
 
     with args.rows.open() as f:
         for line in islice(f, start, n_rows):
-            batch.append(json.loads(line)["text"])
+            row = json.loads(line)
+            batch.append(PROMPT_TEMPLATE.format(word=row["word"], gloss=row["gloss"]))
             if len(batch) >= args.batch_size:
                 flush()
                 if (written // args.batch_size) % 50 == 0:
