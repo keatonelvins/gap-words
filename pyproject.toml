@@ -1,7 +1,7 @@
 [project]
-name = "missing"
+name = "gap-words"
 version = "0.1.0"
-description = "find missing words"
+description = "Find concepts in an LM's latent representation that have no English word."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
